@@ -111,7 +111,7 @@ def build_config(acc, mode):
             ss["realitySettings"]["spiderX"] = acc["spiderX"]
 
     if network == "ws":
-        ss["wsSettings"] = {"path": path, "host": host}
+        ss["wsSettings"] = {"path": path, "host": host, "useBrowserForwarding": True}
     elif network == "tcp" and acc.get("headerType"):
         ss["tcpSettings"] = {"header": {"type": acc["headerType"]}}
     elif network == "grpc":
@@ -120,6 +120,7 @@ def build_config(acc, mode):
         ss["xhttpSettings"] = {"path": path, "host": host, "mode": acc.get("mode", "stream-up")}
 
     ob["streamSettings"] = ss
+    ob["mux"] = {"enabled": True, "concurrency": 8}
 
     # ---- routing ----
     base_rules = [
@@ -162,7 +163,7 @@ def build_config(acc, mode):
         ]
 
     return {
-        "log": {"loglevel": "info",
+        "log": {"loglevel": "warning",
                 "access": f"{CONFIG_DIR}/access.log",
                 "error": f"{CONFIG_DIR}/error.log"},
         "inbounds": [
@@ -172,6 +173,14 @@ def build_config(acc, mode):
              "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}, "tag": "http-in"}
         ],
         "outbounds": [ob, {"protocol": "freedom", "settings": {}, "tag": "direct"}],
+        "dns": {"queryStrategy": "UseIPv4",
+            "servers": [
+                {"address": "https://dns.google/dns-query",
+                 "domains": ["geosite:geolocation-!cn"]},
+                {"address": "localhost",
+                 "domains": ["geosite:cn"]},
+                {"address": "https://dns.google/dns-query"}
+            ]},
         "routing": {"domainStrategy": "IPIfNonMatch", "rules": rules}
     }
 
