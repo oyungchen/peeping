@@ -1,0 +1,13 @@
+# 账户信息（含 UUID/密码，勿提交）
+accounts/accounts.yml
+
+# Xray 运行时文件
+*.log
+*.db
+cash_proxy*.json
+.current_account
+test_config.json
+test.log
+
+# macOS
+.DS_Store

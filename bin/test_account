@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""测试代理账户连通性和延迟，输出评分排名"""
+
+import os, sys, json, subprocess, time, re
+
+ACCOUNTS_FILE = os.path.expanduser("~/.V2rayU/accounts/accounts.yml")
+CONFIG_DIR = os.path.expanduser("~/.V2rayU")
+GEN = os.path.expanduser("~/.V2rayU/bin/gen_config")
+BIN = "/usr/local/v2rayu/bin/xray-core/xray-arm64"
+BIN_DIR = "/usr/local/v2rayu/bin/xray-core"
+TEST_CONFIG = os.path.join(CONFIG_DIR, "test_config.json")
+
+def parse_accounts(path):
+    accounts = []
+    current = None
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+            if not line or line.lstrip().startswith("#"):
+                continue
+            if line.lstrip().startswith("- name:"):
+                if current:
+                    accounts.append(current)
+                current = {"name": line.split(":", 1)[1].strip()}
+            elif current is not None and ":" in line and not line.lstrip().startswith("#"):
+                key, val = line.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if val in ("true", "false"):
+                    current[key] = val == "true"
+                elif val.isdigit():
+                    current[key] = int(val)
+                elif val.startswith('"') and val.endswith('"'):
+                    current[key] = val.strip('"')
+                else:
+                    current[key] = val
+    if current:
+        accounts.append(current)
+    return accounts
+
+def stop_xray():
+    os.system("pkill -f xray-arm64 2>/dev/null")
+    time.sleep(0.5)
+
+def start_test(acc_name):
+    subprocess.run([GEN, acc_name, "global"], capture_output=True)
+    with open(os.path.join(CONFIG_DIR, "cash_proxy.json")) as f:
+        config = json.load(f)
+    config["inbounds"] = [i for i in config["inbounds"] if i["tag"] == "socks-in"]
+    with open(TEST_CONFIG, "w") as f:
+        json.dump(config, f, indent=2)
+    os.system(f"cd '{BIN_DIR}' && '{BIN}' run -c '{TEST_CONFIG}' &>/dev/null &")
+    time.sleep(1.5)
+
+def test_latency(server):
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "5", "-W", "3", server],
+            capture_output=True, text=True, timeout=20
+        )
+        output = result.stdout + result.stderr
+        loss = "N/A"; avg = "N/A"
+        m = re.search(r"(\d+\.?\d*)% packet loss", output)
+        if m: loss = m.group(1) + "%"
+        m = re.search(r"= [\d.]+/([\d.]+)/", output)
+        if m: avg = m.group(1) + "ms"
+        return loss, avg
+    except Exception:
+        return "err", "err"
+
+def test_port(server, port):
+    try:
+        result = subprocess.run(
+            ["nc", "-zv", "-w", "3", server, str(port)],
+            capture_output=True, text=True, timeout=8
+        )
+        return "ok" if "succeeded" in (result.stdout + result.stderr) else "failed"
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except Exception:
+        return "error"
+
+def test_http():
+    result = subprocess.run(
+        ["curl", "-x", "socks5h://127.0.0.1:10808", "--connect-timeout", "10",
+         "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "https://httpbin.org/ip"],
+        capture_output=True, text=True, timeout=15
+    )
+    parts = result.stdout.strip().split()
+    if len(parts) >= 2:
+        return parts[0], parts[1] + "s"
+    return result.stdout.strip(), "timeout"
+
+def test_speed():
+    result = subprocess.run(
+        ["curl", "-x", "socks5h://127.0.0.1:10808", "--connect-timeout", "15",
+         "-s", "-o", "/dev/null", "-w", "%{speed_download}",
+         "https://httpbin.org/bytes/102400"],
+        capture_output=True, text=True, timeout=30
+    )
+    spd = result.stdout.strip()
+    if spd and spd.isdigit():
+        return f"{int(spd) / 1024:.1f} KB/s"
+    return "failed"
+
+def score(results):
+    scored = []
+    for r in results:
+        if r["tcp"] != "ok" or r["http_code"] not in ("200", "301", "302"):
+            continue
+        pts = 0
+        try:
+            loss_val = float(r["loss"].replace("%", ""))
+            pts += max(0, 40 - loss_val * 0.8)
+        except: pass
+        try:
+            rtt_val = float(r["rtt"].replace("ms", ""))
+            pts += max(0, 10 - (rtt_val - 100) * 0.1)
+        except: pass
+        try:
+            ttfb_val = float(r["ttfb"].replace("s", ""))
+            pts += max(0, 30 - (ttfb_val - 1) * (30 / 9))
+        except: pass
+        try:
+            spd_val = float(r["speed"].replace(" KB/s", ""))
+            pts += min(20, spd_val * 0.4)
+        except: pass
+        r["score"] = round(pts, 1)
+        scored.append(r)
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored
+
+def main():
+    accounts = parse_accounts(ACCOUNTS_FILE)
+    if len(sys.argv) > 1:
+        names = sys.argv[1:]
+    else:
+        names = [a["name"] for a in accounts]
+    by_name = {a["name"]: a for a in accounts}
+    target = [by_name[n] for n in names if n in by_name]
+    if not target:
+        print(f"可用: {', '.join(by_name.keys())}")
+        sys.exit(1)
+
+    original_xray = os.popen("pgrep -f xray-arm64").read().strip()
+
+    print(f"{'账户':<10} {'丢包':<8} {'RTT':<10} {'TCP':<8} {'HTTP':<6} {'TTFB':<10} {'速度':<10}")
+    print("-" * 66)
+
+    results = []
+    for acc in target:
+        print(f"{acc['name']:<10}", end=" ", flush=True)
+        stop_xray()
+        loss, rtt = test_latency(acc["server"])
+        print(f"{loss:<8} {rtt:<10}", end=" ", flush=True)
+        tcp = test_port(acc["server"], acc["port"])
+        print(f"{tcp:<8}", end=" ", flush=True)
+        code, ttfb, spd = "N/A", "N/A", "N/A"
+        if tcp == "ok":
+            start_test(acc["name"])
+            code, ttfb = test_http()
+            print(f"{code:<6} {ttfb:<10}", end=" ", flush=True)
+            spd = test_speed()
+            print(f"{spd:<10}", flush=True)
+        else:
+            print(f"{'N/A':<6} {'N/A':<10} {'N/A':<10}")
+        results.append({
+            "name": acc["name"], "server": acc["server"], "port": acc["port"],
+            "loss": loss, "rtt": rtt, "tcp": tcp, "http_code": code,
+            "ttfb": ttfb, "speed": spd,
+        })
+
+    ranked = score(results)
+
+    cur_file = os.path.join(CONFIG_DIR, ".current_account")
+    cur_name, cur_mode = "cash2", "global"
+    if os.path.exists(cur_file):
+        with open(cur_file) as f:
+            pp = f.read().strip().split()
+        cur_name = pp[0] if pp else cur_name
+        cur_mode = pp[1] if len(pp) > 1 else cur_mode
+
+    stop_xray()
+    if original_xray:
+        subprocess.run([GEN, cur_name, cur_mode], capture_output=True)
+        os.system(f"cd '{BIN_DIR}' && '{BIN}' run -c '{os.path.join(CONFIG_DIR, 'cash_proxy.json')}' &>/dev/null &")
+        time.sleep(1)
+
+    if ranked:
+        print()
+        print("=" * 50)
+        best = ranked[0]
+        info = f"丢包{best['loss']}  |  TTFB {best['ttfb']}  |  {best['speed']}"
+        print(f"  ★ 推荐: {best['name']}  (评分: {best['score']}/100  |  {info})")
+        if len(ranked) > 1:
+            print()
+            print("  排名:")
+            for i, r in enumerate(ranked):
+                cur_tag = " ← 当前" if r["name"] == cur_name else ""
+                tag = "★" if i == 0 else f"{i+1}."
+                print(f"  {tag} {r['name']:<10} {r['score']:.1f}分  |  丢包: {r['loss']:<6} |  TTFB: {r['ttfb']:<8} |  速度: {r['speed']}{cur_tag}")
+        print("=" * 50)
+        if original_xray and cur_name != best["name"]:
+            print(f"\n  建议切换: xrayproxy account {best['name']}")
+    else:
+        print("\n  所有账户均不可用")
+    print()
+
+if __name__ == "__main__":
+    main()

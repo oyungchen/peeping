@@ -1,0 +1,32 @@
+# ==========================================
+# 代理账户配置文件模板
+# 使用方法: cp accounts.example.yml accounts.yml → 填入真实信息
+#
+# 字段说明:
+#   name:         账户标识 (唯一)
+#   protocol:     协议: vless / vmess / trojan / shadowsocks
+#   server:       服务器地址
+#   port:         端口
+#   uuid:         用户ID (vmess/vless) 或密码 (trojan/ss)
+#   network:      传输: ws / tcp / grpc / xhttp
+#   security:     加密: tls / reality / none
+#   path:         WS/XHTTP 路径
+#   host:         SNI / Host
+#   flow:         VLESS flow (xtls-rprx-vision / 空, WS传输必须为空)
+#   allowInsecure: true/false, 跳过证书验证 (仅自签证书)
+#   fingerprint:  TLS 指纹 (chrome / firefox / safari / ios / random)
+# ==========================================
+
+# 示例 (请替换为真实信息):
+# - name: my-server
+#   protocol: vless
+#   server: example.com
+#   port: 443
+#   uuid: your-uuid-here
+#   network: ws
+#   security: tls
+#   path: /ray
+#   host: example.com
+#   flow: ""
+#   allowInsecure: false
+#   fingerprint: chrome

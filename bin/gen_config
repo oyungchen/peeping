@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""从 accounts.yml 生成 xray 配置文件"""
+import sys, os, json
+
+ACCOUNTS_FILE = os.path.expanduser("~/.V2rayU/accounts/accounts.yml")
+CONFIG_DIR = os.path.expanduser("~/.V2rayU")
+
+def parse_accounts(path):
+    accounts = []
+    current = None
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+            if not line or line.lstrip().startswith("#"):
+                continue
+            if line.lstrip().startswith("- name:"):
+                if current:
+                    accounts.append(current)
+                current = {"name": line.split(":", 1)[1].strip()}
+            elif current is not None and ":" in line and not line.lstrip().startswith("#"):
+                key, val = line.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if val in ("true", "false"):
+                    current[key] = val == "true"
+                elif val.isdigit():
+                    current[key] = int(val)
+                elif val.startswith('"') and val.endswith('"'):
+                    current[key] = val.strip('"')
+                else:
+                    current[key] = val
+    if current:
+        accounts.append(current)
+    return accounts
+
+def build_config(acc, mode):
+    protocol = acc.get("protocol", "vless")
+    network  = acc.get("network", "ws")
+    security = acc.get("security", "tls")
+    host     = acc.get("host", acc["server"])
+    path     = acc.get("path", "/")
+
+    # ---- outbound: 按协议构建 ----
+    ob = {
+        "protocol": protocol,
+        "tag": "proxy"
+    }
+
+    if protocol == "vless":
+        ob["settings"] = {
+            "vnext": [{
+                "address": acc["server"],
+                "port": acc["port"],
+                "users": [{
+                    "encryption": acc.get("encryption", "none"),
+                    "flow": acc.get("flow", ""),
+                    "id": acc["uuid"]
+                }]
+            }]
+        }
+    elif protocol == "vmess":
+        ob["settings"] = {
+            "vnext": [{
+                "address": acc["server"],
+                "port": acc["port"],
+                "users": [{
+                    "security": acc.get("encryption", "auto"),
+                    "id": acc["uuid"],
+                    "alterId": acc.get("alterId", 0)
+                }]
+            }]
+        }
+    elif protocol == "trojan":
+        ob["settings"] = {
+            "servers": [{
+                "address": acc["server"],
+                "port": acc["port"],
+                "password": acc["uuid"],
+                "flow": acc.get("flow", "")
+            }]
+        }
+    elif protocol == "shadowsocks":
+        ob["settings"] = {
+            "servers": [{
+                "address": acc["server"],
+                "port": acc["port"],
+                "method": acc.get("method", "aes-256-gcm"),
+                "password": acc["uuid"]
+            }]
+        }
+    else:
+        print(f"不支持的协议: {protocol}", file=sys.stderr)
+        sys.exit(1)
+
+    # ---- streamSettings ----
+    ss = {"network": network, "security": security}
+    if security == "tls":
+        ss["tlsSettings"] = {
+            "allowInsecure": acc.get("allowInsecure", True),
+            "fingerprint": acc.get("fingerprint", "chrome"),
+            "serverName": host
+        }
+    elif security == "reality":
+        ss["realitySettings"] = {
+            "fingerprint": acc.get("fingerprint", "chrome"),
+            "serverName": acc.get("serverName", ""),
+            "publicKey": acc.get("publicKey", ""),
+            "shortId": acc.get("shortId", "")
+        }
+        if "spiderX" in acc:
+            ss["realitySettings"]["spiderX"] = acc["spiderX"]
+
+    if network == "ws":
+        ss["wsSettings"] = {"path": path, "host": host}
+    elif network == "tcp" and acc.get("headerType"):
+        ss["tcpSettings"] = {"header": {"type": acc["headerType"]}}
+    elif network == "grpc":
+        ss["grpcSettings"] = {"serviceName": acc.get("serviceName", "")}
+    elif network == "xhttp":
+        ss["xhttpSettings"] = {"path": path, "host": host, "mode": acc.get("mode", "stream-up")}
+
+    ob["streamSettings"] = ss
+
+    # ---- routing ----
+    base_rules = [
+        {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+        {"type": "field", "domain": ["geosite:cn", "geosite:private",
+                                      "geosite:apple", "geosite:icloud", "domain:cn"],
+         "outboundTag": "direct"},
+        {"type": "field", "ip": ["geoip:cn"], "outboundTag": "direct"},
+    ]
+
+    if mode == "global":
+        rules = base_rules + [
+            {"type": "field", "inboundTag": ["socks-in", "http-in"], "outboundTag": "proxy"}
+        ]
+    else:
+        rules = [
+            {
+                "type": "field",
+                "domain": ["domain:googleapis.cn", "domain:gstatic.com",
+                           "domain:googlevideo.com", "domain:ytimg.com", "domain:ggpht.com"],
+                "outboundTag": "proxy"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:google", "geosite:youtube", "geosite:github", "geosite:gitlab",
+                    "geosite:twitter", "geosite:facebook", "geosite:instagram", "geosite:telegram",
+                    "geosite:whatsapp", "geosite:discord", "geosite:reddit", "geosite:medium",
+                    "geosite:openai", "geosite:anthropic", "geosite:cloudflare",
+                    "geosite:netflix", "geosite:disney", "geosite:hulu", "geosite:spotify",
+                    "geosite:tiktok", "geosite:pixiv", "geosite:steam", "geosite:epicgames",
+                    "geosite:nintendo", "geosite:sony", "geosite:microsoft", "geosite:amazon",
+                    "geosite:apple-cn"
+                ],
+                "outboundTag": "proxy"
+            },
+        ] + base_rules + [
+            {"type": "field", "domain": ["geosite:geolocation-!cn"], "outboundTag": "proxy"},
+            {"type": "field", "inboundTag": ["socks-in", "http-in"], "outboundTag": "proxy"}
+        ]
+
+    return {
+        "log": {"loglevel": "info",
+                "access": f"{CONFIG_DIR}/access.log",
+                "error": f"{CONFIG_DIR}/error.log"},
+        "inbounds": [
+            {"port": 10808, "protocol": "socks", "settings": {"udp": True},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}, "tag": "socks-in"},
+            {"port": 10809, "protocol": "http", "settings": {},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}, "tag": "http-in"}
+        ],
+        "outbounds": [ob, {"protocol": "freedom", "settings": {}, "tag": "direct"}],
+        "routing": {"domainStrategy": "IPIfNonMatch", "rules": rules}
+    }
+
+def main():
+    if len(sys.argv) < 2:
+        accounts = parse_accounts(ACCOUNTS_FILE)
+        print("用法: gen_config <account> [global|smart]")
+        print(f"可用: {', '.join(a['name'] for a in accounts)}")
+        sys.exit(1)
+
+    name = sys.argv[1]
+    mode = sys.argv[2] if len(sys.argv) > 2 else "global"
+    accounts = parse_accounts(ACCOUNTS_FILE)
+    by_name = {a["name"]: a for a in accounts}
+
+    if name not in by_name:
+        print(f"未知账户: {name}，可用: {', '.join(by_name.keys())}")
+        sys.exit(1)
+
+    acc = by_name[name]
+    config = build_config(acc, mode)
+
+    out = os.path.join(CONFIG_DIR, "cash_proxy.json")
+    with open(out, "w") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+    cur = os.path.join(CONFIG_DIR, ".current_account")
+    with open(cur, "w") as f:
+        f.write(f"{name} {mode}")
+
+    print(f"{name} | {acc['server']}:{acc['port']} | {mode}")
+
+if __name__ == "__main__":
+    main()
